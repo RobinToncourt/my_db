@@ -112,8 +112,26 @@ impl std::convert::TryFrom<RowBytesArray> for Row {
     }
 }
 
+const PAGE_SIZE: usize = 4096;
+const TABLE_MAX_PAGES: usize = 100;
+const ROWS_PER_PAGE: usize = PAGE_SIZE / Row::SIZE;
+const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+
 struct Table {
-    rows: Vec<Row>,
+    rows_count: usize,
+    pages: [Option<Box<[u8; PAGE_SIZE]>>; TABLE_MAX_PAGES],
+}
+
+impl Table {
+    fn get_mut_row_bytes_array(&mut self, row_number: usize) -> &mut RowBytesArray {
+        let page_num = row_number / ROWS_PER_PAGE;
+        let page: &mut Option<Box<[u8; PAGE_SIZE]>> = &mut self.pages[page_num];
+        let page: &mut [u8; PAGE_SIZE] = page.get_or_insert(Box::new([0; PAGE_SIZE]));
+        let row_offset = row_number % ROWS_PER_PAGE;
+
+        let row_range = (Row::SIZE * row_offset)..Row::SIZE;
+        page[row_range].try_into().unwrap()
+    }
 }
 
 fn main() -> ! {
