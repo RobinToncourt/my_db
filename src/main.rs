@@ -3,6 +3,7 @@
 
 use std::io::Write;
 use std::sync::LazyLock;
+use std::ops::Range;
 
 use regex::Regex;
 
@@ -11,11 +12,10 @@ const EXIT_SUCCESS: i32 = 0;
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // Si le regex est invalide le programme ne peut pas fonctionner.
     #[allow(clippy::expect_used)]
     Regex::new(INSERT_REGEX_STR).expect("Unable to parse regex.")
 });
-
-type RowBytesArray = [u8; Row::SIZE];
 
 struct UnknownMetaCommandError;
 
@@ -27,6 +27,7 @@ enum StatementError {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 enum DeserializeError {
+    InvalidBytesSlice(usize),
     FromUtf8Error(std::string::FromUtf8Error),
     TryFromSliceError(std::array::TryFromSliceError),
 }
@@ -36,78 +37,153 @@ enum StatementType {
     Insert,
 }
 
-struct Row {
-    id: usize,
-    username: String,
-    email: String,
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq, Clone)]
+struct Id(usize);
+impl Id {
+    const SIZE: usize = 8;
+}
+impl std::convert::From<Id> for Vec<u8> {
+    fn from(id: Id) -> Vec<u8> {
+        id.to_be_bytes().into_iter().collect()
+    }
+}
+// TODO: ne fonctionne pas sur un système 32 bits.
+impl std::convert::From<[u8; Self::SIZE]> for Id {
+    fn from(arr: [u8; Self::SIZE]) -> Self {
+        Self(usize::from_be_bytes(arr))
+    }
+}
+impl std::ops::Deref for Id {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq, Clone)]
+struct Username(String);
+impl Username {
+    const SIZE: usize = 32;
+}
+impl std::convert::From<Username> for Vec<u8> {
+    fn from(username: Username) -> Vec<u8> {
+        (*username).clone().into_bytes()
+    }
+}
+impl std::convert::TryFrom<[u8; Self::SIZE]> for Username {
+    type Error = DeserializeError;
+
+    fn try_from(arr: [u8; Self::SIZE]) -> Result<Self, Self::Error> {
+        let username = String::from_utf8(Vec::<u8>::from(arr))
+        .map_err(DeserializeError::FromUtf8Error)?
+        .trim_matches(char::from(0))
+        .to_string();
+
+        Ok(Username(username))
+    }
+}
+impl std::ops::Deref for Username {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq, Clone)]
+struct Email(String);
+impl Email {
+    const SIZE: usize = 255;
+}
+impl std::convert::From<Email> for Vec<u8> {
+    fn from(email: Email) -> Vec<u8> {
+        (*email).clone().into_bytes()
+    }
+}
+impl std::convert::TryFrom<[u8; Self::SIZE]> for Email {
+    type Error = DeserializeError;
+
+    fn try_from(arr: [u8; Self::SIZE]) -> Result<Self, Self::Error> {
+        let email = String::from_utf8(Vec::<u8>::from(arr))
+        .map_err(DeserializeError::FromUtf8Error)?
+        .trim_matches(char::from(0))
+        .to_string();
+
+        Ok(Email(email))
+    }
+}
+impl std::ops::Deref for Email {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+struct Row {
+    id: Id,
+    username: Username,
+    email: Email,
+}
 impl Row {
     const ID_OFFSET: usize = 0;
-    const ID_SIZE: usize = (usize::BITS / 8) as usize;
+    const ID_RANGE: Range<usize> = Row::ID_OFFSET..(Row::ID_OFFSET + Id::SIZE);
 
-    const USERNAME_OFFSET: usize = Self::ID_SIZE;
-    const USERNAME_SIZE: usize = 32;
+    const USERNAME_OFFSET: usize = Self::ID_OFFSET + Id::SIZE;
+    const USERNAME_RANGE: Range<usize> = Row::USERNAME_OFFSET..(Row::USERNAME_OFFSET + Username::SIZE);
 
-    const EMAIL_OFFSET: usize = Self::USERNAME_OFFSET + Self::USERNAME_SIZE;
-    const EMAIL_SIZE: usize = 255;
+    const EMAIL_OFFSET: usize = Self::USERNAME_OFFSET + Username::SIZE;
+    const EMAIL_RANGE: Range<usize> = Row::EMAIL_OFFSET..(Row::EMAIL_OFFSET + Email::SIZE);
 
-    const SIZE: usize = Self::ID_SIZE + Self::USERNAME_SIZE + Self::EMAIL_SIZE;
+    const SIZE: usize = Id::SIZE + Username::SIZE + Email::SIZE;
 }
-
-impl std::convert::From<Row> for RowBytesArray {
-    fn from(row: Row) -> Self {
+impl std::convert::From<Row> for Vec<u8> {
+    fn from(row: Row) -> Vec<u8> {
         let Row {
             id,
             username,
             email,
         } = row;
 
-        let mut result = [0_u8; Row::SIZE];
-
-        let id_range = Row::ID_OFFSET..(Row::ID_OFFSET + Row::ID_SIZE);
-        let username_range = Row::USERNAME_OFFSET..(Row::USERNAME_OFFSET + username.len());
-        let email_range = Row::EMAIL_OFFSET..(Row::EMAIL_OFFSET + email.len());
-
-        result[id_range].clone_from_slice(&id.to_be_bytes());
-        result[username_range].clone_from_slice(username.as_bytes());
-        result[email_range].clone_from_slice(email.as_bytes());
-
-        result
+        let mut bytes = Vec::<u8>::from(id);
+        bytes.append(&mut Vec::<u8>::from(username));
+        bytes.append(&mut Vec::<u8>::from(email));
+        bytes
     }
 }
-
-impl std::convert::TryFrom<RowBytesArray> for Row {
+impl std::convert::TryFrom<&[u8]> for Row {
     type Error = DeserializeError;
 
-    fn try_from(arr: RowBytesArray) -> Result<Self, Self::Error> {
-        let id_range = Row::ID_OFFSET..(Row::ID_OFFSET + Row::ID_SIZE);
-        let username_range = Row::USERNAME_OFFSET..(Row::USERNAME_OFFSET + Row::USERNAME_SIZE);
-        let email_range = Row::EMAIL_OFFSET..(Row::EMAIL_OFFSET + Row::EMAIL_SIZE);
+    fn try_from(arr: &[u8]) -> Result<Self, Self::Error> {
+        if arr.len() < Self::SIZE {
+            return Err(DeserializeError::InvalidBytesSlice(arr.len()));
+        }
 
-        let id = usize::from_be_bytes(
-            arr[id_range].try_into()
-                .map_err(DeserializeError::TryFromSliceError)?
-        );
+        // Les indexation sont valide grâce à la vérification au-dessus.
 
-        let mut username_bytes: Vec<u8> = Vec::new();
-        arr[username_range].clone_into(&mut username_bytes);
-        let username = String::from_utf8(username_bytes)
-            .map_err(DeserializeError::FromUtf8Error)?
-            .trim_matches(char::from(0))
-            .to_string();
+        let id_bytes: [u8; Id::SIZE] = arr[Self::ID_RANGE]
+        .try_into()
+        .map_err(DeserializeError::TryFromSliceError)?;
+        let id = Id::from(id_bytes);
 
-        let mut email_bytes: Vec<u8> = Vec::new();
-        arr[email_range].clone_into(&mut email_bytes);
-        let email = String::from_utf8(email_bytes)
-            .map_err(DeserializeError::FromUtf8Error)?
-            .trim_matches(char::from(0))
-            .to_string();
+        let username_bytes: [u8; Username::SIZE] = arr[Self::USERNAME_RANGE]
+        .try_into()
+        .map_err(DeserializeError::TryFromSliceError)?;
+        let username = Username::try_from(username_bytes)?;
+
+        let email_bytes: [u8; Email::SIZE] = arr[Self::USERNAME_RANGE]
+        .try_into()
+        .map_err(DeserializeError::TryFromSliceError)?;
+        let email = Email::try_from(email_bytes)?;
 
         Ok(Self {
             id,
-            username,
-            email,
+           username,
+           email,
         })
     }
 }
@@ -123,14 +199,14 @@ struct Table {
 }
 
 impl Table {
-    fn get_mut_row_bytes_array(&mut self, row_number: usize) -> &mut RowBytesArray {
+    fn get_row(&mut self, row_number: usize) -> Result<Row, DeserializeError> {
         let page_num = row_number / ROWS_PER_PAGE;
         let page: &mut Option<Box<[u8; PAGE_SIZE]>> = &mut self.pages[page_num];
         let page: &mut [u8; PAGE_SIZE] = page.get_or_insert(Box::new([0; PAGE_SIZE]));
         let row_offset = row_number % ROWS_PER_PAGE;
 
         let row_range = (Row::SIZE * row_offset)..Row::SIZE;
-        page[row_range].try_into().unwrap()
+        Row::try_from(&page[row_range])
     }
 }
 
@@ -207,23 +283,23 @@ fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> {
         };
 
         let username = caps["username"].to_owned();
-        if username.len() > Row::USERNAME_SIZE {
+        if username.len() > Username::SIZE {
             return Err(StatementError::StringTooLong(
-                "username".to_string(), Row::USERNAME_SIZE
+                "username".to_string(), Username::SIZE
             ));
         }
 
         let email = caps["email"].to_owned();
-        if email.len() > Row::EMAIL_SIZE {
+        if email.len() > Email::SIZE {
             return Err(StatementError::StringTooLong(
-                "email".to_string(), Row::EMAIL_SIZE
+                "email".to_string(), Email::SIZE
             ));
         }
 
         let row = Row {
-            id,
-            username,
-            email,
+            id: Id(id),
+            username: Username(username),
+            email: Email(email),
         };
 
         return Ok(StatementType::Insert);
@@ -244,10 +320,15 @@ mod my_db_test {
     use super::*;
 
     #[test]
-    fn test_row_from_into_u8_array() {
-        let id = 42;
-        let username = "abigaël".to_string();
-        let email = "abigaël@yahoo.com".to_string();
+    fn test_id_from_into_u8_slice() {
+
+    }
+
+    #[test]
+    fn test_row_from_into_u8_slice() {
+        let id = Id(42);
+        let username = Username("abigaël".to_string());
+        let email = Email("abigaël@yahoo.com".to_string());
 
         let row = Row {
             id: id.clone(),
@@ -255,23 +336,20 @@ mod my_db_test {
             email: email.clone(),
         };
 
-        let arr: RowBytesArray = row.into();
+        let arr = Vec::<u8>::from(row);
 
-        let id_range = Row::ID_OFFSET..(Row::ID_OFFSET + Row::ID_SIZE);
-        let username_range = Row::USERNAME_OFFSET..(Row::USERNAME_OFFSET + username.len());
-        let email_range = Row::EMAIL_OFFSET..(Row::EMAIL_OFFSET + email.len());
-
-        assert_eq!(arr[id_range], id.to_be_bytes());
-        assert_eq!(&arr[username_range], username.as_bytes());
-        assert_eq!(&arr[email_range], email.as_bytes());
+        assert_eq!(&arr[Row::ID_RANGE], &id.to_be_bytes());
+        assert_eq!(&arr[Row::USERNAME_RANGE], username.as_bytes());
+        assert_eq!(&arr[Row::EMAIL_RANGE], email.as_bytes());
 
         let Row {
-            id,
-            username,
-            email,
-        } = arr.try_into().unwrap();
-        assert_eq!(id, 42);
-        assert_eq!(username, "abigaël");
-        assert_eq!(email, "abigaël@yahoo.com");
+            id: id_deser,
+            username: username_deser,
+            email: email_deser,
+        } = Row::try_from(&arr[..]).unwrap();
+
+        assert_eq!(id_deser, id);
+        assert_eq!(username_deser, username);
+        assert_eq!(email_deser, email);
     }
 }
