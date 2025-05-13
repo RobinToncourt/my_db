@@ -1,9 +1,12 @@
 #![allow(dead_code, unused_variables)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+use std::env;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::{LazyLock, Mutex};
+use std::fs::File;
+use std::path::Path;
 
 use regex::Regex;
 
@@ -19,8 +22,37 @@ static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 static TABLE: LazyLock<Mutex<Table>> = LazyLock::new(|| Mutex::new(Table::default()));
 
+static FILE_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(||
+    Mutex::new(None)
+);
+
+trait MapOkErr<T, E> {
+    type Output<U, F>;
+
+    fn map_ok_err<O, P, U, F>(self, ok_op: O, err_op: P) -> Self::Output<U, F>
+    where
+        O: FnOnce(T) -> U,
+        P: FnOnce(E) -> F;
+}
+
+impl<T, E> MapOkErr<T, E> for Result<T, E> {
+    type Output<U, F> = Result<U, F>;
+
+    fn map_ok_err<O, P, U, F>(self, ok_op: O, err_op: P) -> Self::Output<U, F>
+    where
+        O: FnOnce(T) -> U,
+        P: FnOnce(E) -> F,
+    {
+        self.map(ok_op).map_err(err_op)
+    }
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
 struct UnknownMetaCommandError;
 
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
 enum StatementError {
     UnrecognizedStatement,
     InvalidInsert,
@@ -28,9 +60,7 @@ enum StatementError {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-struct TableFullError;
-
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
 enum DeserializeError {
     InvalidBytesSlice(usize),
     FromUtf8Error(std::string::FromUtf8Error),
@@ -41,9 +71,28 @@ enum DeserializeError {
     },
 }
 
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
+struct TableFullError;
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
+enum StatementOutputError {
+    TableFullError,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
 enum StatementType {
     Select,
     Insert(Row),
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
+enum StatementOutput {
+    Select(Vec<Row>),
+    InsertSuccessfull,
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -141,6 +190,7 @@ impl std::ops::Deref for Email {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq, Clone)]
 struct Row {
     id: Id,
     username: Username,
@@ -230,14 +280,6 @@ struct Table {
     nb_rows: usize,
     pages: [Option<Box<[u8; Self::PAGE_SIZE]>>; Self::MAX_PAGES],
 }
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            nb_rows: 0,
-            pages: [const { None }; Self::MAX_PAGES],
-        }
-    }
-}
 impl Table {
     const PAGE_SIZE: usize = 4096;
     const MAX_PAGES: usize = 100;
@@ -256,7 +298,7 @@ impl Table {
         };
 
         let row_offset = row_number % Self::ROWS_PER_PAGE;
-        let row_range = row_offset .. (row_offset + Row::MAX_SIZE);
+        let row_range = (row_offset * Row::MAX_SIZE)..(row_offset * Row::MAX_SIZE + Row::MAX_SIZE);
         Some(Row::try_from(&page[row_range]))
     }
 
@@ -267,10 +309,11 @@ impl Table {
 
         let page_num = self.nb_rows / Self::ROWS_PER_PAGE;
         let page: &mut Option<Box<[u8; Self::PAGE_SIZE]>> = &mut self.pages[page_num];
-        let page: &mut Box<[u8; Self::PAGE_SIZE]> = page.get_or_insert(Box::new([0; Self::PAGE_SIZE]));
+        let page: &mut Box<[u8; Self::PAGE_SIZE]> =
+            page.get_or_insert(Box::new([0; Self::PAGE_SIZE]));
 
         let row_offset = self.nb_rows % Self::ROWS_PER_PAGE;
-        let row_range = row_offset .. (row_offset + Row::MAX_SIZE);
+        let row_range = (row_offset * Row::MAX_SIZE)..(row_offset * Row::MAX_SIZE + Row::MAX_SIZE);
 
         let serialized_row = <[u8; Row::MAX_SIZE]>::from(row);
         page[row_range].copy_from_slice(&serialized_row);
@@ -279,8 +322,23 @@ impl Table {
         Ok(())
     }
 }
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            nb_rows: 0,
+            pages: [const { None }; Self::MAX_PAGES],
+        }
+    }
+}
 
 fn main() -> ! {
+    let args: Vec<String> = env::args().collect();
+    if args.len() == 2 {
+        if let Ok(mut file_path) = FILE_PATH.lock() {
+            *file_path = Some(args[1].clone());
+        }
+    }
+
     let stdin = std::io::stdin();
     let mut buffer = String::new();
 
@@ -295,6 +353,10 @@ fn main() -> ! {
 
         remove_trailing_newline(&mut buffer);
 
+        if buffer.is_empty() {
+            continue;
+        }
+
         if is_meta_command(&buffer) {
             match do_meta_command(&buffer) {
                 Ok(()) => {}
@@ -305,10 +367,20 @@ fn main() -> ! {
 
         let statement = prepare_statement(&buffer);
         match statement {
-            Ok(statement) => {
-                execute_statement(statement);
-                println!("Executed.");
-            }
+            Ok(statement) => match execute_statement(statement) {
+                Ok(StatementOutput::Select(rows)) => {
+                    for row in rows {
+                        println!("{row}");
+                    }
+                    println!("Executed.");
+                }
+                Ok(StatementOutput::InsertSuccessfull) => {
+                    println!("Executed.");
+                }
+                Err(StatementOutputError::TableFullError) => {
+                    println!("Error: Table full.");
+                }
+            },
             Err(StatementError::UnrecognizedStatement) => {
                 println!("Unrecognized keyword at start of '{buffer}'.");
             }
@@ -334,8 +406,40 @@ fn do_meta_command(buffer: &str) -> Result<(), UnknownMetaCommandError> {
     if buffer == ".exit" {
         std::process::exit(EXIT_SUCCESS)
     }
+    if buffer.starts_with(".save") {
+        write_table_to_disk("/home/robin/Desktop/save.db");
+        return Ok(());
+    }
 
     Err(UnknownMetaCommandError)
+}
+
+fn read_table_form_disk(path: &str) {
+    todo!()
+}
+
+fn write_table_to_disk(path: &str) {
+    // TODO: de-indenter cette fonction.
+    if let Ok(mut file) = File::create(Path::new(path)) {
+        if let Ok(table) = TABLE.lock() {
+            for i in 0..table.nb_rows {
+                if let Some(bytes) = &table.pages[i] {
+                    if let Ok(bytes_written) = file.write(&bytes[..]) {
+                        if bytes_written != bytes.len() {
+                            println!("Coudln't write all bytes.");
+                        }
+                    } else {
+                        println!("Error while saving to file.");
+                    }
+                }
+            }
+        } else {
+            println!("The table is corrupted.");
+        }
+    } else {
+        // TODO: mettre une meilleur trace.
+        println!("Invalid file");
+    }
 }
 
 fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> {
@@ -380,34 +484,38 @@ fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> {
     Err(StatementError::UnrecognizedStatement)
 }
 
-fn execute_statement(statement: StatementType) {
+fn execute_statement(statement: StatementType) -> Result<StatementOutput, StatementOutputError> {
     match statement {
-        StatementType::Select => execute_select(),
-        StatementType::Insert(row) => execute_insert(row).unwrap(),
+        StatementType::Select => Ok(execute_select()),
+        StatementType::Insert(row) => execute_insert(row),
     }
 }
 
-fn execute_select() {
-    // Si le mutex est emppoisonné, la table est invalide.
+fn execute_select() -> StatementOutput {
+    // Si le mutex est empoisonné, la table est invalide.
     #[allow(clippy::expect_used)]
     let table: &Table = &TABLE.lock().expect("The table is corrupted.");
+
+    let mut result = Vec::<Row>::new();
     for row_i in 0..table.nb_rows {
-        if let Some(row_result) = table.get_row(row_i) {
-            match row_result {
-                Ok(row) => println!("{row}"),
-                Err(_) => println!("Error while deserializing the row {row_i}"),
-            }
+        if let Some(Ok(row)) = table.get_row(row_i) {
+            result.push(row);
         }
     }
+    StatementOutput::Select(result)
 }
 
-fn execute_insert(row: Row) -> Result<(), TableFullError> {
-    // Si le mutex est emppoisonné, la table est invalide.
+fn execute_insert(row: Row) -> Result<StatementOutput, StatementOutputError> {
+    // Si le mutex est empoisonné, la table est invalide.
     #[allow(clippy::expect_used)]
     TABLE
         .lock()
         .expect("The table is corrupted.")
         .write_row(row)
+        .map_ok_err(
+            |()| StatementOutput::InsertSuccessfull,
+            |_| StatementOutputError::TableFullError,
+        )
 }
 
 #[cfg(test)]
@@ -498,5 +606,37 @@ mod my_db_test {
     #[test]
     fn test_table_get_row() {
         todo!()
+    }
+
+    #[test]
+    fn test_insert_table_full() {
+        for i in 0..Table::MAX_ROWS {
+            let statement = prepare_statement(&format!("insert {i} a_{i} b_{i}")).unwrap();
+            assert_eq!(
+                execute_statement(statement).unwrap(),
+                StatementOutput::InsertSuccessfull
+            );
+        }
+        let statement =
+            prepare_statement(&format!("insert {i} a_{i} b_{i}", i = Table::MAX_ROWS)).unwrap();
+        assert_eq!(
+            execute_statement(statement).unwrap_err(),
+            StatementOutputError::TableFullError
+        );
+    }
+
+    #[test]
+    fn test_refuse_username_email_too_long() {
+        let username = String::from_utf8(['a' as u8; Username::MAX_SIZE + 1].into()).unwrap();
+        assert_eq!(
+            prepare_statement(&format!("insert 1 {username} a")).unwrap_err(),
+            StatementError::StringTooLong("username".to_owned(), Username::MAX_SIZE)
+        );
+
+        let email = String::from_utf8(['b' as u8; Email::MAX_SIZE + 1].into()).unwrap();
+        assert_eq!(
+            prepare_statement(&format!("insert 2 b {email}")).unwrap_err(),
+            StatementError::StringTooLong("email".to_owned(), Email::MAX_SIZE)
+        );
     }
 }
