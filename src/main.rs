@@ -291,14 +291,18 @@ impl Table {
     }
 
     fn get_row(&self, row_number: usize) -> Option<Result<Row, DeserializeError>> {
+        if row_number >= self.nb_rows {
+            return None;
+        }
+
         let page_num = row_number / Self::ROWS_PER_PAGE;
         let page: &Option<Box<[u8; Self::PAGE_SIZE]>> = &self.pages[page_num];
         let Some(page) = page else {
             return None;
         };
 
-        let row_offset = row_number % Self::ROWS_PER_PAGE;
-        let row_range = (row_offset * Row::MAX_SIZE)..(row_offset * Row::MAX_SIZE + Row::MAX_SIZE);
+        let row_offset = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        let row_range = row_offset..(row_offset + Row::MAX_SIZE);
         Some(Row::try_from(&page[row_range]))
     }
 
@@ -312,8 +316,8 @@ impl Table {
         let page: &mut Box<[u8; Self::PAGE_SIZE]> =
             page.get_or_insert(Box::new([0; Self::PAGE_SIZE]));
 
-        let row_offset = self.nb_rows % Self::ROWS_PER_PAGE;
-        let row_range = (row_offset * Row::MAX_SIZE)..(row_offset * Row::MAX_SIZE + Row::MAX_SIZE);
+        let row_offset = (self.nb_rows % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        let row_range = row_offset..(row_offset + Row::MAX_SIZE);
 
         let serialized_row = <[u8; Row::MAX_SIZE]>::from(row);
         page[row_range].copy_from_slice(&serialized_row);
@@ -604,7 +608,7 @@ mod my_db_test {
     }
 
     #[test]
-    fn test_table_get_row() {
+    fn test_table_write_get_row() {
         todo!()
     }
 
