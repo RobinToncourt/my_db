@@ -2,16 +2,18 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::env;
-use std::io::Write;
-use std::ops::Range;
-use std::sync::{LazyLock, Mutex};
 use std::fs::File;
+use std::io;
+use std::io::{Read, Write};
+use std::ops::Range;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use regex::Regex;
 
 const PROMPT: &str = "my_db> ";
 const EXIT_SUCCESS: i32 = 0;
+const EXIT_ERROR: i32 = -1;
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -22,9 +24,7 @@ static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 static TABLE: LazyLock<Mutex<Table>> = LazyLock::new(|| Mutex::new(Table::default()));
 
-static FILE_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(||
-    Mutex::new(None)
-);
+static FILE_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 trait MapOkErr<T, E> {
     type Output<U, F>;
@@ -94,6 +94,25 @@ enum StatementOutput {
     Select(Vec<Row>),
     InsertSuccessfull,
 }
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+enum CreateTableError {
+    PoisonedFilePath,
+    IoError(io::Error),
+    NotEnoughData,
+    FileIsCorrupted,
+    PoisonedTable,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+enum ReadDataFromFileError {
+    IoError(io::Error),
+    NotEnoughData,
+    FileIsCorrupted(usize, Vec<Box<[u8; Table::PAGE_SIZE]>>),
+}
+
+type ReadDataFromFileResult =
+    Result<(usize, Vec<Box<[u8; Table::PAGE_SIZE]>>), ReadDataFromFileError>;
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[derive(PartialEq, Clone)]
@@ -343,6 +362,22 @@ fn main() -> ! {
         }
     }
 
+    if let Err(e) = create_table() {
+        match e {
+            CreateTableError::PoisonedFilePath => println!("Couldn't load save file."),
+            CreateTableError::IoError(e) => {
+                println!("e");
+                std::process::exit(EXIT_ERROR)
+            },
+            CreateTableError::NotEnoughData => println!("The file did not contains enough data."),
+            CreateTableError::FileIsCorrupted => println!("The file was read but was malfomed, proceed with caution."),
+            CreateTableError::PoisonedTable => {
+                println!("An error occured while loading the save file.");
+                std::process::exit(EXIT_ERROR)
+            }
+        }
+    }
+
     let stdin = std::io::stdin();
     let mut buffer = String::new();
 
@@ -411,21 +446,99 @@ fn do_meta_command(buffer: &str) -> Result<(), UnknownMetaCommandError> {
         std::process::exit(EXIT_SUCCESS)
     }
     if buffer.starts_with(".save") {
-        write_table_to_disk("/home/robin/Desktop/save.db");
-        return Ok(());
+        // TODO: factoriser.
+        if let Ok(path) = FILE_PATH.lock() {
+            if let Some(path) = path.as_ref() {
+                write_table_to_disk(path);
+                println!("Save done");
+                return Ok(());
+            }
+            let path: &str = buffer.split(' ').collect::<Vec<&str>>()[1];
+            write_table_to_disk(path);
+        } else {
+            println!("Invalid file path.");
+        }
     }
 
     Err(UnknownMetaCommandError)
 }
 
-fn read_table_form_disk(path: &str) {
-    todo!()
+fn create_table() -> Result<(), CreateTableError> {
+    let Ok(guard) = FILE_PATH.lock() else {
+        return Err(CreateTableError::PoisonedFilePath);
+    };
+
+    if let Some(path) = guard.as_ref() {
+        let mut is_save_file_corrupted = false;
+        let (nb_rows, pages_vec) = match read_data_from_file(path) {
+            Ok(result) => result,
+            Err(ReadDataFromFileError::IoError(e)) => return Err(CreateTableError::IoError(e)),
+            Err(ReadDataFromFileError::NotEnoughData) => {
+                return Err(CreateTableError::NotEnoughData);
+            }
+            Err(ReadDataFromFileError::FileIsCorrupted(nb_rows, pages_vec)) => {
+                is_save_file_corrupted = true;
+                (nb_rows, pages_vec)
+            }
+        };
+
+        let Ok(mut table) = TABLE.lock() else {
+            return Err(CreateTableError::PoisonedTable);
+        };
+
+        table.nb_rows = nb_rows;
+        for (i, page) in pages_vec.into_iter().enumerate() {
+            table.pages[i] = Some(page);
+        }
+
+        if is_save_file_corrupted {
+            return Err(CreateTableError::FileIsCorrupted);
+        }
+    }
+
+    Ok(())
+}
+
+fn read_data_from_file(path: &str) -> ReadDataFromFileResult {
+    let mut file = File::open(path).map_err(ReadDataFromFileError::IoError)?;
+
+    let mut bytes = Vec::<u8>::new();
+    let bytes_read = file
+        .read_to_end(&mut bytes)
+        .map_err(ReadDataFromFileError::IoError)?;
+
+    assert_eq!(bytes.len(), bytes_read);
+
+    let arr: [u8; 8] = bytes[..8][..]
+        .try_into()
+        .map_err(|_| ReadDataFromFileError::NotEnoughData)?;
+    let nb_rows = usize::from_be_bytes(arr);
+
+    let mut data_are_valid = true;
+    let mut result = Vec::<Box<[u8; Table::PAGE_SIZE]>>::new();
+    for offset in (8..bytes.len()).step_by(Table::PAGE_SIZE) {
+        let page_range = offset..(offset + Table::PAGE_SIZE);
+
+        if let Ok(arr) = <[u8; Table::PAGE_SIZE]>::try_from(&bytes[page_range][..]) {
+            let page = Box::new(arr);
+            result.push(page);
+        } else {
+            data_are_valid = false;
+        }
+    }
+
+    if data_are_valid {
+        Ok((nb_rows, result))
+    } else {
+        Err(ReadDataFromFileError::FileIsCorrupted(nb_rows, result))
+    }
 }
 
 fn write_table_to_disk(path: &str) {
     // TODO: de-indenter cette fonction.
     if let Ok(mut file) = File::create(Path::new(path)) {
         if let Ok(table) = TABLE.lock() {
+            let nb_rows_bytes_written = file.write(&table.nb_rows.to_be_bytes());
             for i in 0..table.nb_rows {
                 if let Some(bytes) = &table.pages[i] {
                     if let Ok(bytes_written) = file.write(&bytes[..]) {
@@ -435,6 +548,8 @@ fn write_table_to_disk(path: &str) {
                     } else {
                         println!("Error while saving to file.");
                     }
+                } else {
+                    // Avancer l'écriture de Table::PAGE_SIZE octets.
                 }
             }
         } else {
@@ -496,7 +611,6 @@ fn execute_statement(statement: StatementType) -> Result<StatementOutput, Statem
 }
 
 fn execute_select() -> StatementOutput {
-    // Si le mutex est empoisonné, la table est invalide.
     #[allow(clippy::expect_used)]
     let table: &Table = &TABLE.lock().expect("The table is corrupted.");
 
@@ -510,7 +624,6 @@ fn execute_select() -> StatementOutput {
 }
 
 fn execute_insert(row: Row) -> Result<StatementOutput, StatementOutputError> {
-    // Si le mutex est empoisonné, la table est invalide.
     #[allow(clippy::expect_used)]
     TABLE
         .lock()
