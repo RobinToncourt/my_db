@@ -6,7 +6,6 @@ use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use regex::Regex;
@@ -14,6 +13,9 @@ use regex::Regex;
 const PROMPT: &str = "my_db> ";
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ERROR: i32 = -1;
+
+const POISONED_TABLE_ERROR_STR: &str = "An error occured while loading the save file.";
+const POISONED_FILE_PATH_ERROR_STR: &str = "Couldn't load save file.";
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -34,7 +36,6 @@ trait MapOkErr<T, E> {
         O: FnOnce(T) -> U,
         P: FnOnce(E) -> F;
 }
-
 impl<T, E> MapOkErr<T, E> for Result<T, E> {
     type Output<U, F> = Result<U, F>;
 
@@ -48,8 +49,24 @@ impl<T, E> MapOkErr<T, E> for Result<T, E> {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(PartialEq)]
-struct UnknownMetaCommandError;
+enum MetaCommandError {
+    MetaCommandSave(MetaCommadSaveError),
+    UnknownMetaCommandError,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+enum MetaCommadSaveError {
+    WriteTableToDisk(WriteTableToDiskError),
+    PoisonedFilePath,
+    NoFileToWriteProvided,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+enum WriteTableToDiskError {
+    IoError(io::Error),
+    PoisonedTable,
+    NotAllBytesWritten,
+}
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[derive(PartialEq)]
@@ -364,15 +381,17 @@ fn main() -> ! {
 
     if let Err(e) = create_table() {
         match e {
-            CreateTableError::PoisonedFilePath => println!("Couldn't load save file."),
-            CreateTableError::IoError(e) => {
-                println!("e");
+            CreateTableError::PoisonedFilePath => println!("{POISONED_FILE_PATH_ERROR_STR}"),
+            CreateTableError::IoError(io_error) => {
+                println!("{io_error}");
                 std::process::exit(EXIT_ERROR)
-            },
+            }
             CreateTableError::NotEnoughData => println!("The file did not contains enough data."),
-            CreateTableError::FileIsCorrupted => println!("The file was read but was malfomed, proceed with caution."),
+            CreateTableError::FileIsCorrupted => {
+                println!("The file was read but was malfomed, proceed with caution.");
+            }
             CreateTableError::PoisonedTable => {
-                println!("An error occured while loading the save file.");
+                println!("{POISONED_TABLE_ERROR_STR}");
                 std::process::exit(EXIT_ERROR)
             }
         }
@@ -399,7 +418,24 @@ fn main() -> ! {
         if is_meta_command(&buffer) {
             match do_meta_command(&buffer) {
                 Ok(()) => {}
-                Err(UnknownMetaCommandError) => println!("Unrecognized command: '{buffer}'."),
+                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+                    WriteTableToDiskError::IoError(io_error),
+                ))) => println!("{io_error}"),
+                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+                    WriteTableToDiskError::PoisonedTable,
+                ))) => println!("{POISONED_TABLE_ERROR_STR}"),
+                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+                    WriteTableToDiskError::NotAllBytesWritten,
+                ))) => println!("Not all bytes where written."),
+                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::PoisonedFilePath)) => {
+                    println!("{POISONED_FILE_PATH_ERROR_STR}");
+                }
+                Err(MetaCommandError::MetaCommandSave(
+                    MetaCommadSaveError::NoFileToWriteProvided,
+                )) => println!("You need to provide a file to save to."),
+                Err(MetaCommandError::UnknownMetaCommandError) => {
+                    println!("Unrecognized command: '{buffer}'.");
+                }
             }
             continue;
         }
@@ -441,26 +477,60 @@ fn is_meta_command(buffer: &str) -> bool {
     buffer.starts_with('.')
 }
 
-fn do_meta_command(buffer: &str) -> Result<(), UnknownMetaCommandError> {
+fn do_meta_command(buffer: &str) -> Result<(), MetaCommandError> {
     if buffer == ".exit" {
         std::process::exit(EXIT_SUCCESS)
     }
     if buffer.starts_with(".save") {
-        // TODO: factoriser.
-        if let Ok(path) = FILE_PATH.lock() {
-            if let Some(path) = path.as_ref() {
-                write_table_to_disk(path);
-                println!("Save done");
-                return Ok(());
-            }
-            let path: &str = buffer.split(' ').collect::<Vec<&str>>()[1];
-            write_table_to_disk(path);
+        return meta_command_save(buffer).map_err(MetaCommandError::MetaCommandSave);
+    }
+
+    Err(MetaCommandError::UnknownMetaCommandError)
+}
+
+fn meta_command_save(buffer: &str) -> Result<(), MetaCommadSaveError> {
+    if let Some(provided_file_path) = buffer.split_ascii_whitespace().nth(1) {
+        let _ =
+            write_table_to_disk(provided_file_path).map_err(MetaCommadSaveError::WriteTableToDisk);
+    } else {
+        let Ok(guard) = FILE_PATH.lock() else {
+            return Err(MetaCommadSaveError::PoisonedFilePath);
+        };
+
+        if let Some(file_path) = guard.as_ref() {
+            let _ = write_table_to_disk(file_path).map_err(MetaCommadSaveError::WriteTableToDisk);
         } else {
-            println!("Invalid file path.");
+            return Err(MetaCommadSaveError::NoFileToWriteProvided);
         }
     }
 
-    Err(UnknownMetaCommandError)
+    Ok(())
+}
+
+fn write_table_to_disk(path: &str) -> Result<(), WriteTableToDiskError> {
+    let mut file = File::create(path).map_err(WriteTableToDiskError::IoError)?;
+    let Ok(table) = TABLE.lock() else {
+        return Err(WriteTableToDiskError::PoisonedTable);
+    };
+    let table_nb_row_bytes = table.nb_rows.to_be_bytes();
+    let table_nb_row_bytes_written = file
+        .write(&table_nb_row_bytes)
+        .map_err(WriteTableToDiskError::IoError)?;
+
+    if table_nb_row_bytes.len() != table_nb_row_bytes_written {
+        return Err(WriteTableToDiskError::NotAllBytesWritten);
+    }
+
+    for page_bytes in table.pages.iter().flatten() {
+        let table_page_bytes_written = file
+            .write(&page_bytes[..])
+            .map_err(WriteTableToDiskError::IoError)?;
+        if page_bytes.len() != table_page_bytes_written {
+            return Err(WriteTableToDiskError::NotAllBytesWritten);
+        }
+    }
+
+    Ok(())
 }
 
 fn create_table() -> Result<(), CreateTableError> {
@@ -507,7 +577,7 @@ fn read_data_from_file(path: &str) -> ReadDataFromFileResult {
         .read_to_end(&mut bytes)
         .map_err(ReadDataFromFileError::IoError)?;
 
-    assert_eq!(bytes.len(), bytes_read);
+    debug_assert_eq!(bytes.len(), bytes_read);
 
     let arr: [u8; 8] = bytes[..8][..]
         .try_into()
@@ -531,33 +601,6 @@ fn read_data_from_file(path: &str) -> ReadDataFromFileResult {
         Ok((nb_rows, result))
     } else {
         Err(ReadDataFromFileError::FileIsCorrupted(nb_rows, result))
-    }
-}
-
-fn write_table_to_disk(path: &str) {
-    // TODO: de-indenter cette fonction.
-    if let Ok(mut file) = File::create(Path::new(path)) {
-        if let Ok(table) = TABLE.lock() {
-            let nb_rows_bytes_written = file.write(&table.nb_rows.to_be_bytes());
-            for i in 0..table.nb_rows {
-                if let Some(bytes) = &table.pages[i] {
-                    if let Ok(bytes_written) = file.write(&bytes[..]) {
-                        if bytes_written != bytes.len() {
-                            println!("Coudln't write all bytes.");
-                        }
-                    } else {
-                        println!("Error while saving to file.");
-                    }
-                } else {
-                    // Avancer l'écriture de Table::PAGE_SIZE octets.
-                }
-            }
-        } else {
-            println!("The table is corrupted.");
-        }
-    } else {
-        // TODO: mettre une meilleur trace.
-        println!("Invalid file");
     }
 }
 
