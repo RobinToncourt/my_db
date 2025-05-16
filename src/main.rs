@@ -765,16 +765,32 @@ mod my_db_test {
 
     #[test]
     fn test_table_write_get_row() {
-        todo!()
+        let mut table = TABLE.lock().unwrap();
+
+        let row = Row {
+            id: Id(42),
+            username: Username("abigaël".to_string()),
+            email: Email("abigaël@yahoo.com".to_string()),
+        };
+
+        assert_eq!(table.write_row(row.clone()), Ok(()));
+
+        let r = table.get_row(0).unwrap();
+
+        assert_eq!(r, Ok(row));
+
+        assert!(table.get_row(1).is_none());
     }
 
     #[test]
     fn test_insert_table_full() {
-        for i in 0..Table::MAX_ROWS {
+        println!("{},", Table::MAX_ROWS);
+        for i in 1..Table::MAX_ROWS {
             let statement = prepare_statement(&format!("insert {i} a_{i} b_{i}")).unwrap();
             assert_eq!(
-                execute_statement(statement).unwrap(),
-                StatementOutput::InsertSuccessfull
+                execute_statement(statement),
+                Ok(StatementOutput::InsertSuccessfull),
+                "insert {i} a_{i} b_{i}"
             );
         }
         let statement =
