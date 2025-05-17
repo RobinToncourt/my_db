@@ -40,23 +40,31 @@ fn main() -> ! {
     }
 
     if let Err(e) = create_table() {
-        match e {
-            CreateTableError::PoisonedFilePath => println!("{POISONED_FILE_PATH_ERROR_STR}"),
-            CreateTableError::IoError(io_error) => {
-                println!("{io_error}");
-                std::process::exit(EXIT_ERROR)
-            }
-            CreateTableError::NotEnoughData => println!("The file did not contains enough data."),
-            CreateTableError::FileIsCorrupted => {
-                println!("The file was read but was malfomed, proceed with caution.");
-            }
-            CreateTableError::PoisonedTable => {
-                println!("{POISONED_TABLE_ERROR_STR}");
-                std::process::exit(EXIT_ERROR)
-            }
-        }
+        handle_create_table_error(e);
     }
 
+    main_loop()
+}
+
+fn handle_create_table_error(e: CreateTableError) {
+    match e {
+        CreateTableError::PoisonedFilePath => println!("{POISONED_FILE_PATH_ERROR_STR}"),
+        CreateTableError::IoError(io_error) => {
+            println!("{io_error}");
+            std::process::exit(EXIT_ERROR)
+        }
+        CreateTableError::NotEnoughData => println!("The file did not contains enough data."),
+        CreateTableError::FileIsCorrupted => {
+            println!("The file was read but was malfomed, proceed with caution.");
+        }
+        CreateTableError::PoisonedTable => {
+            println!("{POISONED_TABLE_ERROR_STR}");
+            std::process::exit(EXIT_ERROR)
+        }
+    }
+}
+
+fn main_loop() -> ! {
     let stdin = std::io::stdin();
     let mut buffer = String::new();
 
@@ -76,27 +84,7 @@ fn main() -> ! {
         }
 
         if is_meta_command(&buffer) {
-            match do_meta_command(&buffer) {
-                Ok(()) => {}
-                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
-                    WriteTableToDiskError::IoError(io_error),
-                ))) => println!("{io_error}"),
-                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
-                    WriteTableToDiskError::PoisonedTable,
-                ))) => println!("{POISONED_TABLE_ERROR_STR}"),
-                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
-                    WriteTableToDiskError::NotAllBytesWritten,
-                ))) => println!("Not all bytes where written."),
-                Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::PoisonedFilePath)) => {
-                    println!("{POISONED_FILE_PATH_ERROR_STR}");
-                }
-                Err(MetaCommandError::MetaCommandSave(
-                    MetaCommadSaveError::NoFileToWriteProvided,
-                )) => println!("You need to provide a file to save to."),
-                Err(MetaCommandError::UnknownMetaCommandError) => {
-                    println!("Unrecognized command: '{buffer}'.");
-                }
-            }
+            handle_do_meta_command_result(do_meta_command(&buffer), &buffer);
             continue;
         }
 
@@ -125,6 +113,30 @@ fn main() -> ! {
             Err(StatementError::StringTooLong(name, max)) => {
                 println!("'{name}' is too long, max: '{max}'.");
             }
+        }
+    }
+}
+
+fn handle_do_meta_command_result(result: Result<(), MetaCommandError>, buffer: &str) {
+    match result {
+        Ok(()) => {}
+        Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+            WriteTableToDiskError::IoError(io_error),
+        ))) => println!("{io_error}"),
+        Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+            WriteTableToDiskError::PoisonedTable,
+        ))) => println!("{POISONED_TABLE_ERROR_STR}"),
+        Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::WriteTableToDisk(
+            WriteTableToDiskError::NotAllBytesWritten,
+        ))) => println!("Not all bytes where written."),
+        Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::PoisonedFilePath)) => {
+            println!("{POISONED_FILE_PATH_ERROR_STR}");
+        }
+        Err(MetaCommandError::MetaCommandSave(MetaCommadSaveError::NoFileToWriteProvided)) => {
+            println!("You need to provide a file to save to.");
+        }
+        Err(MetaCommandError::UnknownMetaCommandError) => {
+            println!("Unrecognized command: '{buffer}'.");
         }
     }
 }
