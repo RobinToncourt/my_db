@@ -1,9 +1,16 @@
 use std::sync::{LazyLock, Mutex};
 
+use crate::pager::{GetPageError, PAGER, Page, Pager};
 use crate::row::{DeserializeError, Row};
-use crate::pager::{GetPageError, PAGER, Pager, Page};
 
 pub static TABLE: LazyLock<Mutex<Table>> = LazyLock::new(|| Mutex::new(Table::default()));
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum GetRowError {
+    PoisonedPager,
+    GetPage(GetPageError),
+    Deserialize(DeserializeError),
+}
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum WriteRowError {
@@ -12,12 +19,7 @@ pub enum WriteRowError {
     GetPage(GetPageError),
 }
 
-pub enum GetRowError {
-    PoisonedPager,
-    GetPage(GetPageError),
-    Deserialize(DeserializeError),
-}
-
+#[derive(Default)]
 pub struct Table {
     nb_rows: usize,
 }
@@ -74,13 +76,6 @@ impl Table {
         self.nb_rows += 1;
 
         Ok(())
-    }
-}
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            nb_rows: 0,
-        }
     }
 }
 

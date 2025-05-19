@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::row::{Email, Id, Row, Username};
-use crate::table::{TABLE, Table};
+use crate::table::{TABLE, Table, WriteRowError};
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -41,9 +41,8 @@ pub enum StatementError {
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(PartialEq)]
 pub enum StatementOutputError {
-    TableFullError,
+    Insert(WriteRowError),
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -121,14 +120,13 @@ pub fn execute_select() -> StatementOutput {
 }
 
 pub fn execute_insert(row: Row) -> Result<StatementOutput, StatementOutputError> {
-    #[allow(clippy::expect_used)]
     TABLE
         .lock()
         .expect("The table is corrupted.")
         .write_row(row)
         .map_ok_err(
             |()| StatementOutput::InsertSuccessfull,
-            |_| StatementOutputError::TableFullError,
+            StatementOutputError::Insert,
         )
 }
 

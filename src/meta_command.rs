@@ -3,12 +3,12 @@ use crate::pager::{PAGER, SaveToDiskError};
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum MetaCommandError {
-    MetaCommandSave(MetaCommadSaveError),
+    MetaCommandSave(MetaCommandSaveError),
     UnknownMetaCommandError,
 }
 
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub enum MetaCommadSaveError {
+pub enum MetaCommandSaveError {
     PoisonedPager,
     SaveToDisk(SaveToDiskError),
 }
@@ -28,17 +28,13 @@ pub fn do_meta_command(buffer: &str) -> Result<(), MetaCommandError> {
     Err(MetaCommandError::UnknownMetaCommandError)
 }
 
-pub fn meta_command_save(buffer: &str) -> Result<(), MetaCommadSaveError> {
+pub fn meta_command_save(buffer: &str) -> Result<(), MetaCommandSaveError> {
     let Ok(mut pager) = PAGER.lock() else {
-        return Err(MetaCommadSaveError::PoisonedPager);
+        return Err(MetaCommandSaveError::PoisonedPager);
     };
 
-    if let Some(provided_file_path) = buffer.split_ascii_whitespace().nth(1) {
-        let _ =
-            pager.save_to_disk(Some(provided_file_path)).map_err(MetaCommadSaveError::SaveToDisk);
-    } else {
-        pager.save_to_disk(None).map_err(MetaCommadSaveError::SaveToDisk);
-    }
-
-    Ok(())
+    let provided_file_path: Option<&str> = buffer.split_ascii_whitespace().nth(1);
+    pager
+        .save_to_disk(provided_file_path)
+        .map_err(MetaCommandSaveError::SaveToDisk)
 }
