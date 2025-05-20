@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write, ErrorKind};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::sync::{LazyLock, Mutex};
 
 use crate::table::TABLE;
@@ -40,7 +40,7 @@ pub enum SetOpenSaveFileError {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum GetPageError {
-    MaxPageExceeded,
+    MaxPageReached,
     IoError(io::Error),
 }
 
@@ -68,14 +68,20 @@ impl Pager {
 
     pub fn set_open_save_file(&mut self, file_path: &str) -> Result<(), SetOpenSaveFileError> {
         // TODO: sauvegarder le chemin même si le fichier n'existe pas.
-        let mut file = OpenOptions::new().read(true).write(true).open(file_path).map_err(SetOpenSaveFileError::IoError)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file_path)
+            .map_err(SetOpenSaveFileError::IoError)?;
 
         let Ok(mut table) = TABLE.lock() else {
             return Err(SetOpenSaveFileError::PoisonedTable);
         };
 
         let mut nb_rows_bytes = [0; 8];
-        let () = file.read_exact(&mut nb_rows_bytes).map_err(SetOpenSaveFileError::IoError)?;
+        let () = file
+            .read_exact(&mut nb_rows_bytes)
+            .map_err(SetOpenSaveFileError::IoError)?;
         let nb_rows = usize::from_be_bytes(nb_rows_bytes);
 
         table.set_nb_rows(nb_rows);
@@ -88,10 +94,12 @@ impl Pager {
 
     pub fn get_page(&mut self, page_num: usize) -> Result<&mut Page, GetPageError> {
         if page_num >= Self::MAX_PAGES {
-            return Err(GetPageError::MaxPageExceeded);
+            return Err(GetPageError::MaxPageReached);
         }
 
         if self.pages[page_num].is_some() {
+            // Je ne peux pas utiliser le modèle `if let` sinon j'ai une ref.
+            #[allow(clippy::unwrap_used)]
             return Ok(self.pages[page_num].as_mut().unwrap());
         }
 
@@ -111,6 +119,8 @@ impl Pager {
         };
 
         self.pages[page_num] = Some(page);
+        // L'option ici est nécessairement `Some`.
+        #[allow(clippy::unwrap_used)]
         Ok(self.pages[page_num].as_mut().unwrap())
     }
 

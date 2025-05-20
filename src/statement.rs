@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::row::{Email, Id, Row, Username};
-use crate::table::{TABLE, Table, WriteRowError};
+use crate::table::{GetRowError, TABLE, WriteRowError};
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -34,19 +34,6 @@ impl<T, E> MapOkErr<T, E> for Result<T, E> {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[derive(PartialEq)]
-pub enum StatementError {
-    UnrecognizedStatement,
-    InvalidInsert,
-    StringTooLong(String, usize),
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-pub enum StatementOutputError {
-    Insert(WriteRowError),
-}
-
-#[cfg_attr(debug_assertions, derive(Debug))]
-#[derive(PartialEq)]
 pub enum StatementType {
     Select,
     Insert(Row),
@@ -54,9 +41,24 @@ pub enum StatementType {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[derive(PartialEq)]
+pub enum StatementError {
+    UnrecognizedStatement,
+    InvalidInsert,
+    StringTooLong(String, usize),
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[derive(PartialEq)]
 pub enum StatementOutput {
     Select(Vec<Row>),
     InsertSuccessfull,
+}
+
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub enum StatementOutputError {
+    PoisonedTable,
+    Select(Vec<Row>, GetRowError),
+    Insert(WriteRowError),
 }
 
 pub fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> {
@@ -101,33 +103,38 @@ pub fn execute_statement(
     statement: StatementType,
 ) -> Result<StatementOutput, StatementOutputError> {
     match statement {
-        StatementType::Select => Ok(execute_select()),
+        StatementType::Select => execute_select(),
         StatementType::Insert(row) => execute_insert(row),
     }
 }
 
-pub fn execute_select() -> StatementOutput {
-    #[allow(clippy::expect_used)]
-    let table: &Table = &TABLE.lock().expect("The table is corrupted.");
+pub fn execute_select() -> Result<StatementOutput, StatementOutputError> {
+    let Ok(table) = TABLE.lock() else {
+        return Err(StatementOutputError::PoisonedTable);
+    };
 
     let mut result = Vec::<Row>::new();
     for row_i in 0..table.get_nb_rows() {
-        if let Some(Ok(row)) = table.get_row(row_i) {
-            result.push(row);
+        if let Some(get_row_result) = table.get_row(row_i) {
+            if let Ok(row) = get_row_result {
+                result.push(row);
+            } else if let Err(get_row_error) = get_row_result {
+                return Err(StatementOutputError::Select(result, get_row_error));
+            }
         }
     }
-    StatementOutput::Select(result)
+    Ok(StatementOutput::Select(result))
 }
 
 pub fn execute_insert(row: Row) -> Result<StatementOutput, StatementOutputError> {
-    TABLE
-        .lock()
-        .expect("The table is corrupted.")
-        .write_row(row)
-        .map_ok_err(
-            |()| StatementOutput::InsertSuccessfull,
-            StatementOutputError::Insert,
-        )
+    let Ok(mut table) = TABLE.lock() else {
+        return Err(StatementOutputError::PoisonedTable);
+    };
+
+    table.write_row(row).map_ok_err(
+        |()| StatementOutput::InsertSuccessfull,
+        StatementOutputError::Insert,
+    )
 }
 
 #[cfg(test)]

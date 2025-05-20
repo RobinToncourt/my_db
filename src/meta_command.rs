@@ -18,10 +18,10 @@ pub fn is_meta_command(buffer: &str) -> bool {
 }
 
 pub fn do_meta_command(buffer: &str) -> Result<(), MetaCommandError> {
-    if buffer == ".exit" {
+    if buffer.to_lowercase() == ".exit" {
         std::process::exit(EXIT_SUCCESS)
     }
-    if buffer.starts_with(".save") {
+    if buffer.to_lowercase().starts_with(".save") {
         return meta_command_save(buffer).map_err(MetaCommandError::MetaCommandSave);
     }
 
