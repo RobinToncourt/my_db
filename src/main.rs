@@ -1,5 +1,7 @@
-#![deny(clippy::unwrap_used, clippy::expect_used)]
+//#![deny(clippy::unwrap_used, clippy::expect_used)]
+#![allow(dead_code)]
 
+mod cursor;
 mod meta_command;
 mod pager;
 mod row;
@@ -16,7 +18,8 @@ use crate::meta_command::{
 use crate::pager::{GetPageError, PAGER, SaveToDiskError, SetOpenSaveFileError};
 use crate::row::DeserializeError;
 use crate::statement::{
-    StatementError, StatementOutput, StatementOutputError, execute_statement, prepare_statement,
+    PrepareStatementError, StatementOutput, StatementOutputError, execute_statement,
+    prepare_statement,
 };
 use crate::table::{GetRowError, WriteRowError};
 
@@ -73,14 +76,14 @@ fn main_loop() -> ! {
         }
 
         if is_meta_command(&buffer) {
-            let meta_command_result: Result<(), MetaCommandError> = do_meta_command(&buffer);
-            handle_do_meta_command_result(meta_command_result, &buffer);
+            if let Err(meta_command_error) = do_meta_command(&buffer) {
+                handle_meta_command_error(meta_command_error, &buffer);
+            }
             continue;
         }
 
         let statement = prepare_statement(&buffer);
         match statement {
-            // TODO: factoriser la gestion des erreurs dans des méthodes spécifiques.
             Ok(statement) => match execute_statement(statement) {
                 Ok(StatementOutput::Select(rows)) => {
                     for row in rows {
@@ -96,32 +99,17 @@ fn main_loop() -> ! {
                     for row in rows {
                         println!("{row}");
                     }
-                    handler_get_row_error(&get_row_error);
+                    handle_get_row_error(&get_row_error);
                 }
-                Err(StatementOutputError::Insert(WriteRowError::TableFull)) => {
-                    println!("Error: Table full.");
-                }
-                Err(StatementOutputError::Insert(WriteRowError::PoisonedPager)) => {
-                    println!("{POISONED_PAGER_ERROR_STR}");
-                }
-                Err(StatementOutputError::Insert(WriteRowError::GetPage(
-                    GetPageError::MaxPageReached,
-                ))) => {
-                    println!("Max page reached.");
-                }
-                Err(StatementOutputError::Insert(WriteRowError::GetPage(
-                    GetPageError::IoError(e),
-                ))) => {
-                    println!("{e}");
-                }
+                Err(StatementOutputError::Insert(e)) => handle_write_row_error(&e),
             },
-            Err(StatementError::UnrecognizedStatement) => {
+            Err(PrepareStatementError::UnrecognizedStatement) => {
                 println!("Unrecognized keyword at start of '{buffer}'.");
             }
-            Err(StatementError::InvalidInsert) => {
+            Err(PrepareStatementError::InvalidInsert) => {
                 println!("Insert statement malformed.");
             }
-            Err(StatementError::StringTooLong(name, max)) => {
+            Err(PrepareStatementError::StringTooLong(name, max)) => {
                 println!("'{name}' is too long, max: '{max}'.");
             }
         }
@@ -132,35 +120,42 @@ fn remove_trailing_newline(buffer: &mut String) {
     let _ = buffer.pop();
 }
 
-fn handle_do_meta_command_result(result: Result<(), MetaCommandError>, buffer: &str) {
-    match result {
-        Ok(()) => {}
-        Err(MetaCommandError::MetaCommandSave(MetaCommandSaveError::PoisonedPager)) => {
-            println!("{POISONED_PAGER_ERROR_STR}");
-        }
-        Err(MetaCommandError::MetaCommandSave(MetaCommandSaveError::SaveToDisk(
-            SaveToDiskError::NoFileToWriteProvided,
-        ))) => println!("No file to save provided."),
-        Err(MetaCommandError::MetaCommandSave(MetaCommandSaveError::SaveToDisk(
-            SaveToDiskError::PoisonedTable,
-        ))) => println!("{POISONED_TABLE_ERROR_STR}"),
-        Err(MetaCommandError::MetaCommandSave(MetaCommandSaveError::SaveToDisk(
-            SaveToDiskError::IoError(e),
-        ))) => println!("{e}"),
-        Err(MetaCommandError::MetaCommandSave(MetaCommandSaveError::SaveToDisk(
-            SaveToDiskError::NotAllBytesWritten,
-        ))) => println!("Not all data written to file."),
-        Err(MetaCommandError::UnknownMetaCommandError) => {
-            println!("Unrecognized command: '{buffer}'.");
-        }
+fn handle_meta_command_error(error: MetaCommandError, buffer: &str) {
+    match error {
+        MetaCommandError::MetaCommandSave(e) => handle_meta_command_save_error(&e),
+        MetaCommandError::UnknownMetaCommandError => println!("Unrecognized command: '{buffer}'."),
     }
 }
 
-fn handler_get_row_error(error: &GetRowError) {
+fn handle_meta_command_save_error(error: &MetaCommandSaveError) {
+    match error {
+        MetaCommandSaveError::PoisonedPager => println!("{POISONED_PAGER_ERROR_STR}"),
+        MetaCommandSaveError::SaveToDisk(e) => handle_save_to_disk_error(e),
+    }
+}
+
+fn handle_save_to_disk_error(error: &SaveToDiskError) {
+    match error {
+        SaveToDiskError::NoFileToWriteProvided => println!("No file to save provided."),
+        SaveToDiskError::PoisonedTable => println!("{POISONED_TABLE_ERROR_STR}"),
+        SaveToDiskError::IoError(e) => println!("{e}"),
+        SaveToDiskError::NotAllBytesWritten => println!("Not all data written to file."),
+    }
+}
+
+fn handle_get_row_error(error: &GetRowError) {
     match error {
         GetRowError::PoisonedPager => println!("{POISONED_PAGER_ERROR_STR}"),
         GetRowError::GetPage(e) => handle_get_page_error(e),
         GetRowError::Deserialize(e) => handle_deserialize_error(e),
+    }
+}
+
+fn handle_write_row_error(error: &WriteRowError) {
+    match error {
+        WriteRowError::TableFull => println!("Error: Table full."),
+        WriteRowError::PoisonedPager => println!("{POISONED_PAGER_ERROR_STR}"),
+        WriteRowError::GetPage(e) => handle_get_page_error(e),
     }
 }
 

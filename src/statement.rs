@@ -41,7 +41,7 @@ pub enum StatementType {
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 #[derive(PartialEq)]
-pub enum StatementError {
+pub enum PrepareStatementError {
     UnrecognizedStatement,
     InvalidInsert,
     StringTooLong(String, usize),
@@ -61,23 +61,23 @@ pub enum StatementOutputError {
     Insert(WriteRowError),
 }
 
-pub fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> {
+pub fn prepare_statement(buffer: &str) -> Result<StatementType, PrepareStatementError> {
     let lowercase: String = buffer.to_lowercase();
     if lowercase.starts_with("select") {
         return Ok(StatementType::Select);
     }
     if lowercase.starts_with("insert") {
         let Some(caps) = INSERT_REGEX.captures(buffer) else {
-            return Err(StatementError::InvalidInsert);
+            return Err(PrepareStatementError::InvalidInsert);
         };
 
         let Ok(id) = caps["id"].parse::<usize>() else {
-            return Err(StatementError::InvalidInsert);
+            return Err(PrepareStatementError::InvalidInsert);
         };
 
         let username = caps["username"].to_owned();
         if username.len() > Username::MAX_SIZE {
-            return Err(StatementError::StringTooLong(
+            return Err(PrepareStatementError::StringTooLong(
                 "username".to_string(),
                 Username::MAX_SIZE,
             ));
@@ -85,7 +85,7 @@ pub fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> 
 
         let email = caps["email"].to_owned();
         if email.len() > Email::MAX_SIZE {
-            return Err(StatementError::StringTooLong(
+            return Err(PrepareStatementError::StringTooLong(
                 "email".to_string(),
                 Email::MAX_SIZE,
             ));
@@ -96,7 +96,7 @@ pub fn prepare_statement(buffer: &str) -> Result<StatementType, StatementError> 
         return Ok(StatementType::Insert(row));
     }
 
-    Err(StatementError::UnrecognizedStatement)
+    Err(PrepareStatementError::UnrecognizedStatement)
 }
 
 pub fn execute_statement(
@@ -146,13 +146,13 @@ mod statement_test {
         let username = String::from_utf8(['a' as u8; Username::MAX_SIZE + 1].into()).unwrap();
         assert_eq!(
             prepare_statement(&format!("insert 1 {username} a")).unwrap_err(),
-            StatementError::StringTooLong("username".to_owned(), Username::MAX_SIZE)
+            PrepareStatementError::StringTooLong("username".to_owned(), Username::MAX_SIZE)
         );
 
         let email = String::from_utf8(['b' as u8; Email::MAX_SIZE + 1].into()).unwrap();
         assert_eq!(
             prepare_statement(&format!("insert 2 b {email}")).unwrap_err(),
-            StatementError::StringTooLong("email".to_owned(), Email::MAX_SIZE)
+            PrepareStatementError::StringTooLong("email".to_owned(), Email::MAX_SIZE)
         );
     }
 }

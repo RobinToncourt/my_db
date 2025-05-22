@@ -1,9 +1,9 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Arc, Mutex};
 
 use crate::pager::{GetPageError, PAGER, Page, Pager};
 use crate::row::{DeserializeError, Row};
 
-pub static TABLE: LazyLock<Mutex<Table>> = LazyLock::new(|| Mutex::new(Table::default()));
+pub static TABLE: LazyLock<Arc<Mutex<Table>>> = LazyLock::new(|| Arc::new(Mutex::new(Table::default())));
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum GetRowError {
@@ -19,8 +19,8 @@ pub enum WriteRowError {
     GetPage(GetPageError),
 }
 
-#[derive(Default)]
 pub struct Table {
+    pager: Arc<Mutex<Pager>>,
     nb_rows: usize,
 }
 impl Table {
@@ -33,6 +33,19 @@ impl Table {
 
     pub fn set_nb_rows(&mut self, nb_rows: usize) {
         self.nb_rows = nb_rows;
+    }
+
+    pub fn get(&mut self, row_number: usize) -> &[u8] {
+        assert!(row_number < self.nb_rows, "Max row reached.");
+
+        let pager: &mut Pager = Arc::get_mut(&mut self.pager).unwrap().get_mut().unwrap();
+
+        let page_num = row_number / Self::ROWS_PER_PAGE;
+        let page: &[u8] = pager.get(page_num);
+
+        let row_offset = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        let row_range = row_offset..(row_offset + Row::MAX_SIZE);
+        &page[row_range]
     }
 
     pub fn get_row(&self, row_number: usize) -> Option<Result<Row, GetRowError>> {
@@ -76,6 +89,14 @@ impl Table {
         self.nb_rows += 1;
 
         Ok(())
+    }
+}
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            pager: PAGER.clone(),
+            nb_rows: PAGER.lock().unwrap().get_file_nb_rows(),
+        }
     }
 }
 

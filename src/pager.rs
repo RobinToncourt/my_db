@@ -1,11 +1,11 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::table::TABLE;
 
-pub static PAGER: LazyLock<Mutex<Pager>> = LazyLock::new(|| Mutex::new(Pager::new()));
+pub static PAGER: LazyLock<Arc<Mutex<Pager>>> = LazyLock::new(|| Arc::new(Mutex::new(Pager::new())));
 
 type PageType = Box<[u8; Page::SIZE]>;
 
@@ -68,28 +68,48 @@ impl Pager {
 
     pub fn set_open_save_file(&mut self, file_path: &str) -> Result<(), SetOpenSaveFileError> {
         // TODO: sauvegarder le chemin même si le fichier n'existe pas.
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(file_path)
             .map_err(SetOpenSaveFileError::IoError)?;
 
-        let Ok(mut table) = TABLE.lock() else {
-            return Err(SetOpenSaveFileError::PoisonedTable);
-        };
-
-        let mut nb_rows_bytes = [0; 8];
-        let () = file
-            .read_exact(&mut nb_rows_bytes)
-            .map_err(SetOpenSaveFileError::IoError)?;
-        let nb_rows = usize::from_be_bytes(nb_rows_bytes);
-
-        table.set_nb_rows(nb_rows);
-
         self.save_file = Some(file);
 
         self.pages = [const { None }; Self::MAX_PAGES];
         Ok(())
+    }
+
+    pub fn get_file_nb_rows(&mut self) -> usize {
+        if let Some(file) = self.save_file.as_mut() {
+            let mut nb_rows_bytes = [0; 8];
+            let () = file.read_exact(&mut nb_rows_bytes).unwrap();
+            usize::from_be_bytes(nb_rows_bytes)
+        } else {
+            0
+        }
+    }
+
+    pub fn get(&mut self, page_num: usize) -> &[u8] {
+        assert!(page_num < Self::MAX_PAGES, "Max page reached.");
+
+        if self.pages[page_num].is_some() {
+            return &self.pages[page_num].as_ref().unwrap()[..];
+        }
+
+        let page = if let Some(save_file) = self.save_file.as_mut() {
+            let offset = 8 + Page::SIZE * page_num;
+            let seek_from = SeekFrom::Start(offset as u64);
+            let _ = save_file.seek(seek_from).unwrap();
+            let mut page = Page::default();
+            save_file.read_exact(&mut page[..]).unwrap();
+            page
+        } else {
+            Page::default()
+        };
+
+        self.pages[page_num] = Some(page);
+        &self.pages[page_num].as_ref().unwrap()[..]
     }
 
     pub fn get_page(&mut self, page_num: usize) -> Result<&mut Page, GetPageError> {
