@@ -1,43 +1,39 @@
-use std::sync::{Arc, Mutex};
+use std::{cell::RefCell, rc::Rc};
 
-use crate::table::{TABLE, Table};
+use crate::table::Table;
 
 pub enum CursorError {
     PoisonedTable,
 }
 
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Cursor {
-    table: Arc<Mutex<Table>>,
+    table: Rc<RefCell<Table>>,
     row_num: usize,
 }
 impl Cursor {
-    pub fn at_start(table: Arc<Mutex<Table>>) -> Self {
-        Self {
-            table,
-            row_num: 0,
-        }
+    pub fn at_start(table: Rc<RefCell<Table>>) -> Self {
+        Self { table, row_num: 0 }
     }
 
-    pub fn at_end(table: Arc<Mutex<Table>>) -> Result<Self, CursorError> {
-        let Ok(table_unlock) = TABLE.lock() else {
-            return Err(CursorError::PoisonedTable);
-        };
+    pub fn at_end(table: Rc<RefCell<Table>>) -> Self {
+        let row_num = table.borrow().get_nb_rows();
 
-        Ok(Self {
-            table,
-            row_num: table_unlock.get_nb_rows(),
-        })
+        Self { table, row_num }
     }
 
     pub fn is_end_of_table(&self) -> bool {
-        let table = TABLE.lock().expect("Table is poisoned.");
-
-        table.get_nb_rows() <= self.row_num
+        self.table.borrow().get_nb_rows() <= self.row_num
     }
 
-    pub fn get(&mut self) -> &[u8] {
-        let table: &mut Table = Arc::get_mut(&mut self.table).unwrap().get_mut().unwrap();
-        table.get(self.row_num)
+    pub fn get(&self) -> &[u8] {
+        let slice_pointer = self.table.borrow().get(self.row_num);
+        <&[u8]>::from(slice_pointer)
+    }
+
+    pub fn get_mut(&mut self) -> &mut [u8] {
+        let slice_pointer_mut = self.table.borrow_mut().get_mut(self.row_num);
+        <&mut [u8]>::from(slice_pointer_mut)
     }
 
     pub fn advance(&mut self) {

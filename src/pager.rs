@@ -1,11 +1,8 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::table::TABLE;
-
-pub static PAGER: LazyLock<Arc<Mutex<Pager>>> = LazyLock::new(|| Arc::new(Mutex::new(Pager::new())));
+use crate::slice_pointer::{SlicePointer, SlicePointerMut};
 
 type PageType = Box<[u8; Page::SIZE]>;
 
@@ -52,6 +49,7 @@ pub enum SaveToDiskError {
     NotAllBytesWritten,
 }
 
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Pager {
     save_file: Option<File>,
     pages: [Option<Page>; Self::MAX_PAGES],
@@ -59,9 +57,21 @@ pub struct Pager {
 impl Pager {
     pub const MAX_PAGES: usize = 100;
 
-    pub fn new() -> Self {
+    pub fn new(file_path: Option<&str>) -> Self {
+        let save_file = if let Some(file_path) = file_path {
+            Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(file_path)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
         Self {
-            save_file: None,
+            save_file,
             pages: [const { None }; Self::MAX_PAGES],
         }
     }
@@ -80,25 +90,9 @@ impl Pager {
         Ok(())
     }
 
-    pub fn get_file_nb_rows(&mut self) -> usize {
-        if let Some(file) = self.save_file.as_mut() {
-            let mut nb_rows_bytes = [0; 8];
-            let () = file.read_exact(&mut nb_rows_bytes).unwrap();
-            usize::from_be_bytes(nb_rows_bytes)
-        } else {
-            0
-        }
-    }
-
-    pub fn get(&mut self, page_num: usize) -> &[u8] {
-        assert!(page_num < Self::MAX_PAGES, "Max page reached.");
-
-        if self.pages[page_num].is_some() {
-            return &self.pages[page_num].as_ref().unwrap()[..];
-        }
-
-        let page = if let Some(save_file) = self.save_file.as_mut() {
-            let offset = 8 + Page::SIZE * page_num;
+    fn load_or_create_page(&mut self, page_num: usize) -> Page {
+        if let Some(save_file) = self.save_file.as_mut() {
+            let offset = Page::SIZE * page_num;
             let seek_from = SeekFrom::Start(offset as u64);
             let _ = save_file.seek(seek_from).unwrap();
             let mut page = Page::default();
@@ -106,10 +100,37 @@ impl Pager {
             page
         } else {
             Page::default()
-        };
+        }
+    }
+
+    pub fn get(&mut self, page_num: usize) -> SlicePointer {
+        assert!(page_num < Self::MAX_PAGES, "Max page reached.");
+
+        if self.pages[page_num].is_some() {
+            let page = self.pages[page_num].as_mut().unwrap();
+            return SlicePointer::from(&page[..]);
+        }
+
+        let page = self.load_or_create_page(page_num);
 
         self.pages[page_num] = Some(page);
-        &self.pages[page_num].as_ref().unwrap()[..]
+        let page = self.pages[page_num].as_mut().unwrap();
+        SlicePointer::from(&page[..])
+    }
+
+    pub fn get_mut(&mut self, page_num: usize) -> SlicePointerMut {
+        assert!(page_num < Self::MAX_PAGES, "Max page reached.");
+
+        if self.pages[page_num].is_some() {
+            let page = self.pages[page_num].as_mut().unwrap();
+            return SlicePointerMut::from(&mut page[..]);
+        }
+
+        let page = self.load_or_create_page(page_num);
+
+        self.pages[page_num] = Some(page);
+        let page = self.pages[page_num].as_mut().unwrap();
+        SlicePointerMut::from(&mut page[..])
     }
 
     pub fn get_page(&mut self, page_num: usize) -> Result<&mut Page, GetPageError> {
@@ -144,7 +165,10 @@ impl Pager {
         Ok(self.pages[page_num].as_mut().unwrap())
     }
 
-    pub fn save_to_disk(&mut self, file_path: Option<&str>) -> Result<(), SaveToDiskError> {
+    pub fn save_to_disk(
+        &mut self,
+        file_path: Option<&str>,
+    ) -> Result<(), SaveToDiskError> {
         let save_file = if let Some(path) = file_path {
             &mut File::create(path).map_err(SaveToDiskError::IoError)?
         } else if let Some(file) = self.save_file.as_mut() {
@@ -156,19 +180,6 @@ impl Pager {
             return Err(SaveToDiskError::NoFileToWriteProvided);
         };
 
-        let Ok(table) = TABLE.lock() else {
-            return Err(SaveToDiskError::PoisonedTable);
-        };
-
-        let table_nb_row_bytes = table.get_nb_rows().to_be_bytes();
-        let table_nb_row_bytes_written = save_file
-            .write(&table_nb_row_bytes)
-            .map_err(SaveToDiskError::IoError)?;
-
-        if table_nb_row_bytes.len() != table_nb_row_bytes_written {
-            return Err(SaveToDiskError::NotAllBytesWritten);
-        }
-
         for page_bytes in self.pages.iter().flatten() {
             let table_page_bytes_written = save_file
                 .write(&page_bytes[..])
@@ -179,5 +190,13 @@ impl Pager {
         }
 
         Ok(())
+    }
+}
+impl Default for Pager {
+    fn default() -> Self {
+        Self {
+            save_file: None,
+            pages: [const { None }; Self::MAX_PAGES],
+        }
     }
 }

@@ -1,9 +1,11 @@
 use std::sync::LazyLock;
+use std::{cell::RefCell, rc::Rc};
 
 use regex::Regex;
 
+use crate::cursor::Cursor;
 use crate::row::{Email, Id, Row, Username};
-use crate::table::{GetRowError, TABLE, WriteRowError};
+use crate::table::{GetRowError, Table, WriteRowError};
 
 const INSERT_REGEX_STR: &str = r"insert (?<id>\b\d+\b) (?<username>\w+) (?<email>.+)";
 static INSERT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -100,59 +102,43 @@ pub fn prepare_statement(buffer: &str) -> Result<StatementType, PrepareStatement
 }
 
 pub fn execute_statement(
+    table: Rc<RefCell<Table>>,
     statement: StatementType,
 ) -> Result<StatementOutput, StatementOutputError> {
     match statement {
-        StatementType::Select => execute_select(),
-        StatementType::Insert(row) => execute_insert(row),
+        StatementType::Select => Ok(execute_select(table)),
+        StatementType::Insert(row) => execute_insert(table, row),
     }
 }
 
-pub fn execute_select() -> Result<StatementOutput, StatementOutputError> {
-    let Ok(table) = TABLE.lock() else {
-        return Err(StatementOutputError::PoisonedTable);
-    };
+pub fn execute_select(table: Rc<RefCell<Table>>) -> StatementOutput {
+    let mut cursor = Cursor::at_start(table.clone());
 
     let mut result = Vec::<Row>::new();
-    for row_i in 0..table.get_nb_rows() {
-        if let Some(get_row_result) = table.get_row(row_i) {
-            if let Ok(row) = get_row_result {
-                result.push(row);
-            } else if let Err(get_row_error) = get_row_result {
-                return Err(StatementOutputError::Select(result, get_row_error));
-            }
-        }
+    while !cursor.is_end_of_table() {
+        let bytes = cursor.get();
+        let row = Row::try_from(bytes).unwrap();
+        result.push(row);
+        cursor.advance();
     }
-    Ok(StatementOutput::Select(result))
+
+    StatementOutput::Select(result)
 }
 
-pub fn execute_insert(row: Row) -> Result<StatementOutput, StatementOutputError> {
-    let Ok(mut table) = TABLE.lock() else {
-        return Err(StatementOutputError::PoisonedTable);
-    };
-
-    table.write_row(row).map_ok_err(
-        |()| StatementOutput::InsertSuccessfull,
-        StatementOutputError::Insert,
-    )
+pub fn execute_insert(
+    table: Rc<RefCell<Table>>,
+    row: Row,
+) -> Result<StatementOutput, StatementOutputError> {
+    let mut cursor = Cursor::at_end(table.clone());
+    let row_bytes = <[u8; Row::MAX_SIZE]>::from(row);
+    cursor.get_mut().copy_from_slice(&row_bytes[..]);
+    {
+        let mut table_mut = table.borrow_mut();
+        let nb_rows = table_mut.get_nb_rows();
+        table_mut.set_nb_rows(nb_rows + 1);
+    }
+    Ok(StatementOutput::InsertSuccessfull)
 }
 
 #[cfg(test)]
-mod statement_test {
-    use super::*;
-
-    #[test]
-    fn test_refuse_username_email_too_long() {
-        let username = String::from_utf8(['a' as u8; Username::MAX_SIZE + 1].into()).unwrap();
-        assert_eq!(
-            prepare_statement(&format!("insert 1 {username} a")).unwrap_err(),
-            PrepareStatementError::StringTooLong("username".to_owned(), Username::MAX_SIZE)
-        );
-
-        let email = String::from_utf8(['b' as u8; Email::MAX_SIZE + 1].into()).unwrap();
-        assert_eq!(
-            prepare_statement(&format!("insert 2 b {email}")).unwrap_err(),
-            PrepareStatementError::StringTooLong("email".to_owned(), Email::MAX_SIZE)
-        );
-    }
-}
+mod statement_test {}

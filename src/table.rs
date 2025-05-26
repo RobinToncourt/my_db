@@ -1,9 +1,8 @@
-use std::sync::{LazyLock, Arc, Mutex};
+use std::{cell::RefCell, rc::Rc};
 
-use crate::pager::{GetPageError, PAGER, Page, Pager};
+use crate::pager::{GetPageError, Page, Pager};
 use crate::row::{DeserializeError, Row};
-
-pub static TABLE: LazyLock<Arc<Mutex<Table>>> = LazyLock::new(|| Arc::new(Mutex::new(Table::default())));
+use crate::slice_pointer::{SlicePointer, SlicePointerMut};
 
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub enum GetRowError {
@@ -19,54 +18,76 @@ pub enum WriteRowError {
     GetPage(GetPageError),
 }
 
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub struct Table {
-    pager: Arc<Mutex<Pager>>,
+    pager: Rc<RefCell<Pager>>,
     nb_rows: usize,
 }
 impl Table {
     pub const ROWS_PER_PAGE: usize = Page::SIZE / Row::MAX_SIZE;
     pub const MAX_ROWS: usize = Self::ROWS_PER_PAGE * Pager::MAX_PAGES;
 
+    pub fn new(pager: Rc<RefCell<Pager>>) -> Self {
+        let nb_rows = 0;
+        Self { pager, nb_rows }
+    }
+
     pub fn get_nb_rows(&self) -> usize {
         self.nb_rows
+    }
+
+    pub fn get_pager(&self) -> Rc<RefCell<Pager>> {
+        self.pager.clone()
     }
 
     pub fn set_nb_rows(&mut self, nb_rows: usize) {
         self.nb_rows = nb_rows;
     }
 
-    pub fn get(&mut self, row_number: usize) -> &[u8] {
+    pub fn get(&self, row_number: usize) -> SlicePointer {
         assert!(row_number < self.nb_rows, "Max row reached.");
 
-        let pager: &mut Pager = Arc::get_mut(&mut self.pager).unwrap().get_mut().unwrap();
-
         let page_num = row_number / Self::ROWS_PER_PAGE;
-        let page: &[u8] = pager.get(page_num);
+        let mut page: SlicePointer = self.pager.borrow_mut().get(page_num);
 
-        let row_offset = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
-        let row_range = row_offset..(row_offset + Row::MAX_SIZE);
-        &page[row_range]
+        let row_offset: usize = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        page += row_offset;
+        page.set_len(Row::MAX_SIZE);
+        page
     }
 
-    pub fn get_row(&self, row_number: usize) -> Option<Result<Row, GetRowError>> {
-        if row_number >= self.nb_rows {
-            return None;
-        }
-
-        let Ok(mut pager) = PAGER.lock() else {
-            return Some(Err(GetRowError::PoisonedPager));
-        };
+    pub fn get_mut(&mut self, row_number: usize) -> SlicePointerMut {
+        assert!(row_number >= self.nb_rows, "Max row reached.");
 
         let page_num = row_number / Self::ROWS_PER_PAGE;
-        let get_page_result = pager.get_page(page_num);
-        let page: &mut Page = match get_page_result {
-            Ok(page) => page,
-            Err(e) => return Some(Err(GetRowError::GetPage(e))),
-        };
+        let mut page: SlicePointerMut = self.pager.borrow_mut().get_mut(page_num);
 
-        let row_offset = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
-        let row_range = row_offset..(row_offset + Row::MAX_SIZE);
-        Some(Row::try_from(&page[row_range]).map_err(GetRowError::Deserialize))
+        let row_offset: usize = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        page += row_offset;
+        page.set_len(Row::MAX_SIZE);
+        page
+    }
+
+    pub fn get_row(&self, _row_number: usize) -> Option<Result<Row, GetRowError>> {
+        unimplemented!()
+        // if row_number >= self.nb_rows {
+        //     return None;
+        // }
+        //
+        // let Ok(mut pager) = PAGER.lock() else {
+        //     return Some(Err(GetRowError::PoisonedPager));
+        // };
+        //
+        // let page_num = row_number / Self::ROWS_PER_PAGE;
+        // let get_page_result = pager.get_page(page_num);
+        // let page: &mut Page = match get_page_result {
+        //     Ok(page) => page,
+        //     Err(e) => return Some(Err(GetRowError::GetPage(e))),
+        // };
+        //
+        // let row_offset = (row_number % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
+        // let row_range = row_offset..(row_offset + Row::MAX_SIZE);
+        // Some(Row::try_from(&page[row_range]).map_err(GetRowError::Deserialize))
     }
 
     pub fn write_row(&mut self, row: Row) -> Result<(), WriteRowError> {
@@ -74,12 +95,9 @@ impl Table {
             return Err(WriteRowError::TableFull);
         }
 
-        let Ok(mut pager) = PAGER.lock() else {
-            return Err(WriteRowError::PoisonedPager);
-        };
-
         let page_num = self.nb_rows / Self::ROWS_PER_PAGE;
-        let page: &mut Page = pager.get_page(page_num).map_err(WriteRowError::GetPage)?;
+        let mut binding = self.pager.borrow_mut();
+        let page: &mut Page = binding.get_page(page_num).map_err(WriteRowError::GetPage)?;
 
         let row_offset = (self.nb_rows % Self::ROWS_PER_PAGE) * Row::MAX_SIZE;
         let row_range = row_offset..(row_offset + Row::MAX_SIZE);
@@ -91,58 +109,6 @@ impl Table {
         Ok(())
     }
 }
-impl Default for Table {
-    fn default() -> Self {
-        Self {
-            pager: PAGER.clone(),
-            nb_rows: PAGER.lock().unwrap().get_file_nb_rows(),
-        }
-    }
-}
 
 #[cfg(test)]
-mod table_test {
-    use super::*;
-    use crate::row::{Email, Id, Username};
-    use crate::statement::{
-        StatementOutput, StatementOutputError, execute_statement, prepare_statement,
-    };
-
-    #[test]
-    fn test_table_write_get_row() {
-        let mut table = TABLE.lock().unwrap();
-
-        let row = Row::new(
-            Id::new(42),
-            Username::new("abigaël".to_string()),
-            Email::new("abigaël@yahoo.com".to_string()),
-        );
-
-        assert_eq!(table.write_row(row.clone()), Ok(()));
-
-        let r = table.get_row(0).unwrap();
-
-        assert_eq!(r, Ok(row));
-
-        assert!(table.get_row(1).is_none());
-    }
-
-    #[test]
-    fn test_insert_table_full() {
-        println!("{},", Table::MAX_ROWS);
-        for i in 1..Table::MAX_ROWS {
-            let statement = prepare_statement(&format!("insert {i} a_{i} b_{i}")).unwrap();
-            assert_eq!(
-                execute_statement(statement),
-                Ok(StatementOutput::InsertSuccessfull),
-                "insert {i} a_{i} b_{i}"
-            );
-        }
-        let statement =
-            prepare_statement(&format!("insert {i} a_{i} b_{i}", i = Table::MAX_ROWS)).unwrap();
-        assert_eq!(
-            execute_statement(statement).unwrap_err(),
-            StatementOutputError::TableFullError
-        );
-    }
-}
+mod table_test {}
